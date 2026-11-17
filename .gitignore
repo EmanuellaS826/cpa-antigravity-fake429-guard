@@ -1,0 +1,8 @@
+# private notes for the maintainer (server details), not shared
+cpa_guard-审查记录和进度.md
+# runtime files
+state/
+find_trigger_last.txt
+__pycache__/
+*.pyc
+.DS_Store
