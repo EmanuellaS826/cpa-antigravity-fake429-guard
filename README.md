@@ -1,6 +1,6 @@
 # CPA 反重力（Antigravity）"假 429" 处理手册
 
-整理日期：2026-11-17。适用：CLIProxyAPI（下称 CPA）8.0.72～8.0.76，用反重力 OAuth 账号对外提供 Gemini 等模型，接 Hermes、AstrBot、omp、Claude Code、Codex 这类 agent 产品。
+整理日期：2026-11-17。适用：CLIProxyAPI（下称 CPA）8.0.72～8.0.78（8.0.77、8.0.78 只确认了规则还在、服务正常，没重测触发句），用反重力 OAuth 账号对外提供 Gemini 等模型，接 Hermes、AstrBot、omp、Claude Code、Codex 这类 agent 产品。
 
 这份手册可以直接分享给朋友，里面没有任何密钥、IP 或个人信息。给 AI 维护者看的硬性规则在第 9 节，**AI 动手之前必须先读第 9 节**。
 
@@ -405,6 +405,12 @@ CPA 8.0.73～8.0.76 和这件事相关的变化（只看了更新说明）：`pa
   ```
   能看到规则就行。CPA 以后如果改了这两个配置项的名字，要照新版 `config.example.yaml` 改过去。
 - **agent 升级**：规则在 CPA 上，agent 升级不会让规则消失。但新版 agent 可能改了系统提示的措辞，出现新的触发句。升级后聊一句检查（第 5 节）。
+- **CPA 放在 nginx 后面时，管理页可能"输对密码也被封"**（2026-11-19，8.0.78 上遇到）：管理接口同一个 IP 输错 5 次（不带密钥也算）就封 30 分钟。新版的 `server.trusted-proxies` 默认是空列表，意思是不信任 nginx 带的 `X-Forwarded-For`，所有经 nginx 的请求都算 `127.0.0.1`。网上有扫描器（UA `cpa-batch/1.0`）不停猜管理密钥，它们猜错 5 次，就把 `127.0.0.1` 封了，你也一起被封（提示 `IP banned due to too many failed attempts`）。修法：在 `config.yaml` 的 `server` 下加
+  ```yaml
+  trusted-proxies:
+    - 127.0.0.1
+  ```
+  然后**重启 CPA**（这一项不会热重载；重启也会清掉现有的封禁）。之后按访客真实 IP 计数。前提：CPA 只监听 `127.0.0.1`，外面只能经 nginx 进来，否则别人可以伪造 `X-Forwarded-For`。
 
 ---
 
@@ -500,6 +506,7 @@ python3 /root/find_trigger.py --log <日志路径> [--baseline <上一版>]
 | 2026-11-15 | 安卓聊天 App 的记忆功能（实测，`<memory_format>` 段落里） | `A fact goes in the file for the domain it belongs to, not whichever file happens to be open.` | 整句同义改写 |
 | 2026-11-15 | WorkBuddy（实测，gemini-3.8-flash-high、gemini-4-hydrogen-xhigh 都中） | 系统提示第一行 `This conversation is powered by gemini-3.8-flash-high`（拆成单词都不触发，整行才触发） | 正则整行删除 `(?m)^This conversation is powered by [^\r\n]*\r?\n?`，不绑定模型名 |
 | 2026-11-17 | Hermes（cpa_guard 实测，gemini-3.8-flash-high） | 两行各自单独就会触发：`When the user asks you to build, run, or verify something, the deliverable is a working artifact backed by real tool output — not a description of one. …` 和 `If a tool, install, or network call fails and blocks the real path, say so directly and try an alternative … NEVER substitute plausible-looking fabricated output …` | cpa_guard 加了两条整行正则，把这两行换成 `gpt-6-luna` 翻译的中文版；触发文字和完整提示经 CPA 都返回 200 |
+| 2026-11-19 | WorkBuddy 新版（cpa_guard 实测，gemini-4-neon-xhigh；CPA 8.0.79） | 第 10 行安全声明 `IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, …`，翻译成中文仍 429（按意思拦）。同一提示里新的身份句 `You are powered by the model named gemini-4-neon-xhigh…` 单独替换后仍 429，不是这次的原因 | 人工决定整行删除 `(?m)^[ \t]*IMPORTANT:[ \t]+Assist[ \t]+with[ \t]+authorized[ \t]+security[ \t]+testing[^\r\n]*\r?\n?`，完整提示经 CPA 返回 200 |
 
 "社区"条目的出处：CLIProxyAPI issue #4696、#5751、#5848、#7049，oh-my-pi issue #18706。
 
@@ -519,7 +526,7 @@ python3 /root/find_trigger.py --log <日志路径> [--baseline <上一版>]
 4. **写规则走 CPA 的管理接口**：GET 读出 `antigravity` 下的整个配置，PATCH 写回"旧规则 + 新规则"，再读回核对：只允许规则列表变化、而且只多了这一条。读不到现有规则就不写（以后再试）；读回和预期不一致（例如 PATCH 变成了追加，或词替换没了），就**不再写任何东西、停止自动改规则**，发 MANUAL 事件写明哪里不对和备份位置，要 `--resume` 才恢复。写进去但还没验证的规则（规则和替换文字）记在状态里；有这种规则时 guard 先把它撤回，撤回之前不调查、不写新规则；程序中途崩了，下次启动也会先撤回。撤回时重新读一次当前列表，只删规则和替换文字都对得上的那一条，人在面板里加的或改过的规则不受影响。2026-11-16 在真实服务器上做过一次"原样写回"的测试：规则、词替换、`antigravity-credits` 都不变；CPA 会重写 `config.yaml`，注释的缩进会变、少了几条注释，规则内容等价。
 5. **规则怎么写**：
    - **不删行，改成中文**：请一个**非反重力**的模型（`--rewrite-model`，默认 `gpt-6-luna`，走 CPA 的 Codex 渠道，碰不到谷歌账号，被引用的触发句也不会让它 429）把触发行翻译成简体中文；文件路径、命令、工具名（从出错请求里的工具清单读出来）、网址、代码原样保留，不合格的翻译不用。规则是整行锚定的正则（`^…$`，数字写成 `[0-9]+`），把这一行换成中文版。
-   - 每个中文版都要经 CPA 验证不再 429；最多试 3 个，都不行就**不加规则**，只通知。设计上**从不删行**：删掉一行说明（尤其是工具用法）可能让 agent 悄悄变笨，比 429 更难发现。
+   - 每个中文版都要经 CPA 验证不再 429；最多试 3 个。如果直接翻译后仍然 429（说明谷歌是按意思拦的，比如提到 DoS、C2、漏洞利用的安全声明），后面几次改成"意思相近、但不点名具体攻击手段、产品或敏感话题"的中文。都不行就**不加规则**，只通知。设计上**从不删行**：删掉一行说明（尤其是工具用法）可能让 agent 悄悄变笨，比 429 更难发现；确实要删的（例如 2026-11-19 WorkBuddy 的安全声明）由人决定后手动加规则。
    - 已有的规则会先改写这一行时，新规则按改写后的样子生成（新规则排在后面执行）。
 6. **每条规则写完立刻验证**：把触发文字原样发给 CPA，必须 200（没有 429 才算有效）；不行就撤回，试下一个候选。全部规则写完再发一次完整提示。中途被打断（预算用完、403 等）时，已经单独验证有效的规则保留，正在验证的那条撤回。
 7. **遇到下面这些就停，不乱试**：

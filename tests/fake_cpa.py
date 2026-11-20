@@ -27,13 +27,15 @@ def apply_rules(text):
 
 
 def fake_translate(prompt):
-    """Replace every ordinary word with 词; keep paths, code tokens and the listed tool names."""
+    """Replace every ordinary word with 词 (with 安 when asked for a softened rewrite); keep paths, code
+    tokens and the listed tool names. A trigger of "词 词 词" makes plain translations still 429."""
     line = prompt.split("Line:\n", 1)[1].split("\n\n")[0]
     if CFG.get("rewriter") == "echo":
         return line
     m = re.search(r"tool names and must appear unchanged: ([^\n]+)", prompt)
     tools = set(m.group(1).split(", ")) if m else set()
-    return " ".join(w if KEEP.search(w) or w in tools else "词" for w in line.split())
+    word = "安" if "content filter" in prompt else "词"
+    return " ".join(w if KEEP.search(w) or w in tools else word for w in line.split())
 
 
 class Handler(BaseHTTPRequestHandler):

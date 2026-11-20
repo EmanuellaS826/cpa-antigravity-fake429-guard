@@ -563,22 +563,32 @@ class Guard:
         self.event(status.upper(), f"{STATUS_TITLE.get(status, status)}（{fp[:8]}）", detail)
 
     # ---- rules
-    def reword(self, line, rejected, tools=()):
+    def reword(self, line, rejected, tools=(), soften=False):
         """The line translated into Simplified Chinese by a NON-Antigravity model (so the Google account is
         not touched and the quoted trigger cannot 429 it), with paths, commands, tool names, URLs and code
-        tokens kept exactly; or None."""
+        tokens kept exactly; or None. soften=True (used after a plain translation still 429ed): a Chinese
+        paraphrase with the same intent that names no specific sensitive technique, product or topic."""
         model = self.a.rewrite_model
         if not model or self.model_re.search(model):
             return None
-        prompt = ("Translate the following single line, taken from an AI assistant's system prompt, into Simplified "
-                  "Chinese. Keep its meaning and instructions exactly. Keep every file path, command, tool name, "
-                  "placeholder (like <tool>), URL, code token and Markdown marker (#, -, *, `) EXACTLY as written, "
-                  "untranslated. Reply with the translated line only, on one line, no quotes, no explanation."
-                  "\n\nLine:\n" + line)
+        if soften:
+            prompt = ("The following line, taken from an AI assistant's system prompt, is rejected by a content filter "
+                      "even when translated, because of what it mentions. Rewrite it in Simplified Chinese as one short, "
+                      "general instruction with the same intent, WITHOUT naming any specific attack technique, weapon, "
+                      "malware, exploit, tool category, product, company, political or sexual topic, or other sensitive "
+                      "term. Keep every file path, command, tool name, placeholder (like <tool>), URL and code token "
+                      "EXACTLY as written. Reply with the rewritten line only, on one line, no quotes, no explanation."
+                      "\n\nLine:\n" + line)
+        else:
+            prompt = ("Translate the following single line, taken from an AI assistant's system prompt, into Simplified "
+                      "Chinese. Keep its meaning and instructions exactly. Keep every file path, command, tool name, "
+                      "placeholder (like <tool>), URL, code token and Markdown marker (#, -, *, `) EXACTLY as written, "
+                      "untranslated. Reply with the translated line only, on one line, no quotes, no explanation."
+                      "\n\nLine:\n" + line)
         if tools:
             prompt += "\n\nThese are tool names and must appear unchanged: " + ", ".join(tools)
         if rejected:
-            prompt += "\n\nThese translations were rejected, use different wording:\n" + "\n".join("- " + r for r in rejected)
+            prompt += "\n\nThese versions were rejected, use different wording:\n" + "\n".join("- " + r for r in rejected)
         req = urllib.request.Request(
             self.a.base + "/v1/chat/completions",
             data=json.dumps({"model": model, "temperature": 1.0, "max_tokens": 300,
@@ -595,16 +605,17 @@ class Guard:
         if (not cand or "\n" in cand or cand == line or cand in rejected or len(cand) > 2 * len(line) + 50
                 or not re.search(r"[\u4e00-\u9fff]", cand) or any(t not in cand for t in protected)):
             rejected.append(cand or "(空)")
-            return self.reword(line, rejected, tools) if len(rejected) < 3 else None
+            return self.reword(line, rejected, tools, soften) if len(rejected) < 3 else None
         return cand
 
     def install(self, tester, spec):
         """Replace the trigger line with its Chinese translation and check through CPA that the trigger
-        text no longer 429s. Up to 3 translations are tried; the line is never deleted. A rule that fails
-        or whose check is interrupted is removed again."""
-        rejected = []
+        text no longer 429s. When a translation still 429s, the remaining tries ask for a softened Chinese
+        paraphrase (same intent, no specific sensitive terms). Up to 3 versions are tried; the line is never
+        deleted. A rule that fails or whose check is interrupted is removed again."""
+        rejected, soften = [], False
         for _ in range(3):
-            cand = self.reword(spec["line"], rejected, spec.get("tools", ()))
+            cand = self.reword(spec["line"], rejected, spec.get("tools", ()), soften)
             if cand is None:
                 break
             rejected.append(cand)
@@ -620,9 +631,10 @@ class Guard:
                 self.st.d["unverified"] = [u for u in self.st.d["unverified"] if u != [rule["pattern"], rule["replacement"]]]
                 self.st.d["rules"].append(time.time())
                 self.st.save()
-                return f"改成中文：{cand}"
+                return f"{'改写成不含敏感词的中文' if soften else '改成中文'}：{cand}"
             if not self.remove_rules([rule], "中文版仍然 429"):
                 raise ft.Abort("没用的规则撤回失败")
+            soften = True   # the meaning itself is filtered: a plain translation will not do
         raise DeadRule()
 
     def apply_result(self, item, tester, found, more):
