@@ -87,7 +87,7 @@ class State:
         self.path = path
         self.d = {"halted": None, "apply_disabled": None, "hits": [], "handled": {}, "pending": {},
                   "known": {}, "rules": [], "attempts": {}, "cap_notified": {}, "unverified": [],
-                  "last_start": 0, "quiet_until": 0}
+                  "last_start": 0, "quiet_until": 0, "resumed_at": 0}
         if os.path.exists(path):
             with open(path, encoding="utf-8") as fh:
                 self.d.update(json.load(fh))
@@ -851,7 +851,7 @@ class Guard:
         self.seen = self.logs()
         settled = self.logs(settled=True)
         self.tos_seen = set(settled)      # files still being written get their 403 check later
-        cutoff = time.time() - 3600
+        cutoff = max(time.time() - 3600, self.st.d["resumed_at"])   # a 403 a human already resumed after stays handled
         if not self.a.dry_run:
             for name in settled:   # a 403 that arrived while the guard was down
                 p = os.path.join(self.a.log_dir, name)
@@ -918,6 +918,7 @@ def main():
     if a.resume:
         g.st.refresh_flags()
         g.st.d["halted"] = g.st.d["apply_disabled"] = None
+        g.st.d["resumed_at"] = time.time()
         g.st.save()
         print("已清除停止标志（halted / apply_disabled）。")
         return 0
