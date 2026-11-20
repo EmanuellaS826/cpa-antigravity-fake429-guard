@@ -57,6 +57,7 @@ MAX_PENDING = 5
 MAX_RULES_PER_DAY = 3
 MAX_INVESTIGATIONS_PER_AGENT_DAY = 3
 MAX_LINE_CHARS = 300
+MAX_SENTENCES = 12        # a trigger line with 2..12 sentences is narrowed to the sentence(s) that 429 alone
 KEEP_BACKUPS = 10
 UNSAFE_LINE = re.compile(r"[`$\\/<>{}_]|^\s*[-*]\s*[\w.-]+\s*:")   # paths, commands, tool/skill names
 PROVIDER = "/config/oauth/providers/antigravity"
@@ -177,6 +178,24 @@ def line_pattern(line):
     body = "".join("[0-9]+" if p[0] in "0123456789" else ("[ \\t]+" if p[0] in " \t" else re2_escape(p))
                    for p in parts if p)
     return "(?m)^[ \\t]*" + body + "[ \\t]*\\r?$\\n?"
+
+
+def sentence_pattern(sentence):
+    """Go-RE2 regex for one sentence inside a line (not anchored), blanks and digit runs generalised."""
+    parts = re.split(r"([0-9]+|[ \t]+)", sentence.strip())
+    return "".join("[0-9]+" if p[0] in "0123456789" else ("[ \\t]+" if p[0] in " \t" else re2_escape(p))
+                   for p in parts if p)
+
+
+def split_sentences(line):
+    """Sentences of one line; pieces shorter than 20 characters (e.g. after "e.g.") stay with the previous one."""
+    out = []
+    for piece in re.split(r"(?<=[.!?。！？])\s+", line.strip()):
+        if out and (len(piece) < 20 or len(out[-1]) < 20):
+            out[-1] += " " + piece
+        elif piece:
+            out.append(piece)
+    return out
 
 
 def transform(patterns, words, text):
@@ -637,6 +656,26 @@ class Guard:
             soften = True   # the meaning itself is filtered: a plain translation will not do
         raise DeadRule()
 
+    def narrow(self, tester, spec, eff_system):
+        """A long trigger line often holds one bad sentence among harmless ones, and translating the
+        whole line keeps that sentence's meaning (still 429). So each sentence is first sent alone
+        (a 200 costs nothing, a 429 one hit) and only the sentences that 429 by themselves become rules.
+        When none does alone (the combination triggers), or a sentence rule would not match cleanly,
+        the whole line is kept as the unit."""
+        sents = split_sentences(spec["line"])
+        if not 2 <= len(sents) <= MAX_SENTENCES:
+            return [spec]
+        log(f"触发行有 {len(sents)} 句，先逐句找出触发的那句……")
+        bad = [s for i, s in enumerate(sents, 1)
+               if tester.triggers(ft.NEUTRAL_SYSTEM + "\n" + s, f"触发行第 {i} 句", fresh=True)]
+        subs = [{"pattern": sentence_pattern(s), "line": s, "text": s, "tools": tools_in(s, spec.get("tools", ()))}
+                for s in bad]
+        if not subs or len(subs) == len(sents) or any(
+                not 1 <= len(re.findall(re.compile(s["pattern"], re.ASCII), eff_system)) <= 3 for s in subs):
+            log("单句定位不了（没有单独触发的句子，或句子规则匹配不干净），整行翻译")
+            return [spec]
+        return subs
+
     def apply_result(self, item, tester, found, more):
         fp, system = item["fp"], item["system"]
         report = [f"找到 {len(found)} 处触发句（已复测）："]
@@ -682,13 +721,16 @@ class Guard:
         self.backup(before)
 
         tester.sent = 0
-        done, dead, full_ok, stop = [], [], None, None
+        eff = transform(pats_old, words, system)
+        done, dead, finished, full_ok, stop = [], [], set(), None, None
         try:
             for spec in specs:
-                try:
-                    done.append((spec, self.install(tester, spec)))
-                except DeadRule:
-                    dead.append(spec)
+                for sub in self.narrow(tester, spec, eff):
+                    try:
+                        done.append((sub, self.install(tester, sub)))
+                    except DeadRule:
+                        dead.append(sub)
+                finished.add(spec["text"])
             if done and not (more or manual or dead):
                 full_ok = not tester.triggers(system, "验证：原始完整提示", fresh=True)
         except (ft.Abort, ft.LimitReached, BudgetExhausted, Halted) as exc:
@@ -704,7 +746,6 @@ class Guard:
                     else "没验证的规则可能还在 CPA 里，见上面的 MANUAL 事件。" if self.st.d["unverified"]
                     else "没验证完的规则已撤回。")
             report.append(f"没有做完（{stop.__class__.__name__}: {str(stop)[:100]}）：已验证有效的规则保留；{left}")
-            finished = {s["text"] for s, _ in done} | {s["text"] for s in dead}
             rest = [f for f in found if f[1] not in finished and any(s["text"] == f[1] for s in specs)]
             self.finish(fp, "partial" if done else "rolled_back", "\n".join(report))
             if rest and not self.st.d["apply_disabled"]:   # confirmed, rule not written yet: no need to search again
