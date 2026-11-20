@@ -359,7 +359,14 @@ def ddmin(units, triggers):
     return sorted([0, last] + cur)
 
 
-SUSPECT_RE = re.compile(r"powered by|you are\b|built (on|by|with)|created by|developed by|https?://|^\s*#{1,6}\s", re.I)
+# Most likely first: model identity lines (the known WorkBuddy triggers), then the first line,
+# then other identity lines, then URLs and headings. The cap applies after ranking.
+SUSPECT_TIERS = [
+    re.compile(r"powered by|model (named|id)\b|built (on|by|with)|created by|developed by", re.I),
+    None,  # first non-empty line
+    re.compile(r"you are\b", re.I),
+    re.compile(r"https?://|^\s*#{1,6}\s", re.I),
+]
 
 
 def pick_suspects(lines, baseline_lines, cap=12):
@@ -373,13 +380,14 @@ def pick_suspects(lines, baseline_lines, cap=12):
         for i, l in enumerate(lines):
             if l.strip() and l.strip() not in known:
                 add(i)
-    for i, l in enumerate(lines):
-        if l.strip():
-            add(i)  # first non-empty line
-            break
-    for i, l in enumerate(lines):
-        if SUSPECT_RE.search(l):
-            add(i)
+    for tier in SUSPECT_TIERS:
+        for i, l in enumerate(lines):
+            if tier is None:
+                if l.strip():
+                    add(i)
+                    break
+            elif tier.search(l):
+                add(i)
     return order[:cap]
 
 
