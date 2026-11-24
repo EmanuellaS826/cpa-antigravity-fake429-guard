@@ -508,7 +508,7 @@ python3 /root/find_trigger.py --log <日志路径> [--baseline <上一版>]
 | 2026-11-17 | Hermes（cpa_guard 实测，gemini-3.8-flash-high） | 两行各自单独就会触发：`When the user asks you to build, run, or verify something, the deliverable is a working artifact backed by real tool output — not a description of one. …` 和 `If a tool, install, or network call fails and blocks the real path, say so directly and try an alternative … NEVER substitute plausible-looking fabricated output …` | cpa_guard 加了两条整行正则，把这两行换成 `gpt-6-luna` 翻译的中文版；触发文字和完整提示经 CPA 都返回 200 |
 | 2026-11-19 | WorkBuddy 新版（cpa_guard 实测，gemini-4-neon-xhigh；CPA 8.0.79） | 第 10 行安全声明 `IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, …`，翻译成中文仍 429（按意思拦）。同一提示里新的身份句 `You are powered by the model named gemini-4-neon-xhigh…` 单独替换后仍 429，不是这次的原因 | 人工决定整行删除 `(?m)^[ \t]*IMPORTANT:[ \t]+Assist[ \t]+with[ \t]+authorized[ \t]+security[ \t]+testing[^\r\n]*\r?\n?`，完整提示经 CPA 返回 200 |
 | 2026-11-19 | Hermes 新版开场白（`SOUL.md` 第 1 行，cpa_guard + 逐句实测，gemini-3.8-flash-high） | 第 1 行里只有一句会触发：`Be direct: match the length of your reply to the weight of the ask — a one-line question gets a one-line answer, and finished work gets a short report of what changed, what's verified, and what's left, never a replay of the process.`（同一行的身份句和其余 4 句都 200）。cpa_guard 把整行（664 字）翻成中文 3 次都仍 429 | 人工加了只换这一句的正则 `Be[ \t]+direct:…never[ \t]+a[ \t]+replay[ \t]+of[ \t]+the[ \t]+process\.` → `回答要简洁，篇幅和问题的分量相当：简单的问题简短回答；任务做完后简要说明改了什么、确认了什么、还剩什么，不复述过程。`，原始第 1 行经 CPA 返回 200 |
-| 2026-11-24 | 用 Claude Agent SDK（TypeScript）的客户端直连 CPA（cpa_guard 实测，gemini-3.8-flash-high；CPA 8.1.0） | 两行各自单独就会触发：第 1 行计费标记 `x-anthropic-billing-header: cc_version=…; cc_entrypoint=sdk-ts;` 和第 4 行 `You are an interactive agent that helps users with software engineering tasks.` | 计费标记全是代码、没法翻译，人工同意后整行删除 `(?m)^[ \t]*x-anthropic-billing-header:[^\r\n]*\r?\n?`（不绑定版本号），经 CPA 返回 200；第 4 行交给 cpa_guard 翻译成中文。当时翻译模型 `gpt-6-luna` 过载（502），cpa_guard 改为暂存、15 分钟后重试，不再直接放弃 |
+| 2026-11-24 | Cherry Studio 的智能体功能（内置 Claude Agent SDK，经 newAPI 转发；cpa_guard 实测，gemini-3.8-flash-high；CPA 8.1.0，8.1.2 复测同样 429） | 两行各自单独就会触发：第 1 行计费标记 `x-anthropic-billing-header: cc_version=…; cc_entrypoint=sdk-ts;` 和第 4 行 `You are an interactive agent that helps users with software engineering tasks.`（第 2 行 `You are Claude Code…` 和第 6 行安全声明已被原有规则处理） | 计费标记全是代码、没法翻译，人工同意后整行删除 `(?m)^[ \t]*x-anthropic-billing-header:[^\r\n]*\r?\n?`（不绑定版本号）；第 4 行由 cpa_guard 换成 `gpt-6-luna` 翻译的中文 `你是一个帮助用户完成软件工程任务的交互式代理。`，完整提示经 CPA 返回 200。当时 `gpt-6-luna` 过载（502）了 50 分钟，因此加了"暂存重试"和备用翻译模型 |
 
 "社区"条目的出处：CLIProxyAPI issue #4696、#5751、#5848、#7049，oh-my-pi issue #18706。
 
@@ -518,7 +518,7 @@ python3 /root/find_trigger.py --log <日志路径> [--baseline <上一版>]
 
 ## 11. 自动处理：cpa_guard（在 CPA 服务器上常驻运行）
 
-不想手动找触发句时用它。它盯着 CPA 的 `error-*.log`，发现新的反重力假 429 就自己找触发行、写规则、验证，**全程不需要人决定**。人只会收到结果：`state/events.log`，配了 `BARK_URL` 就推送到手机（Bark），也可以用 `--notify-cmd` 接别的通知。
+不想手动找触发句时用它。它盯着 CPA 的 `error-*.log`，发现新的反重力假 429 就自己找触发行、写规则、验证，**全程不需要人决定**。人只会收到通知：`state/events.log`，配了 `BARK_URL` 就推送到手机（Bark），也可以用 `--notify-cmd` 接别的通知。开始处理时推一条"发现假 429"，处理完推结果；假 429 还在出现、guard 却没去处理（同一提示刚处理过、排队中、预算用完、停止状态等）时，最多每 30 分钟推一条"假 429 还在出现"，所以一波 429 不会没有动静。需要人看的通知用 Bark 的"时效性通知"（专注模式下也会显示），所有通知都存进 Bark 历史；每次推送成功或失败都会写进 guard 日志。
 
 ### 它怎么做（对着 `cpa_guard.py`）
 
@@ -527,7 +527,7 @@ python3 /root/find_trigger.py --log <日志路径> [--baseline <上一版>]
 3. **先用不发 429 的办法**：对比同一个 agent 上一次通过的提示，新增行最可疑；再看第一行、`powered by`、`You are`、网址、标题。一个能直接命中的触发句，约 2 个 429（4 次上游命中）。
 4. **写规则走 CPA 的管理接口**：GET 读出 `antigravity` 下的整个配置，PATCH 写回"旧规则 + 新规则"，再读回核对：只允许规则列表变化、而且只多了这一条。读不到现有规则就不写（以后再试）；读回和预期不一致（例如 PATCH 变成了追加，或词替换没了），就**不再写任何东西、停止自动改规则**，发 MANUAL 事件写明哪里不对和备份位置，要 `--resume` 才恢复。写进去但还没验证的规则（规则和替换文字）记在状态里；有这种规则时 guard 先把它撤回，撤回之前不调查、不写新规则；程序中途崩了，下次启动也会先撤回。撤回时重新读一次当前列表，只删规则和替换文字都对得上的那一条，人在面板里加的或改过的规则不受影响。2026-11-16 在真实服务器上做过一次"原样写回"的测试：规则、词替换、`antigravity-credits` 都不变；CPA 会重写 `config.yaml`，注释的缩进会变、少了几条注释，规则内容等价。
 5. **规则怎么写**：
-   - **不删行，改成中文**：请一个**非反重力**的模型（`--rewrite-model`，默认 `gpt-6-luna`，走 CPA 的 Codex 渠道，碰不到谷歌账号，被引用的触发句也不会让它 429）把触发行翻译成简体中文；文件路径、命令、工具名（从出错请求里的工具清单读出来）、网址、代码原样保留，不合格的翻译不用。规则是整行锚定的正则（`^…$`，数字写成 `[0-9]+`），把这一行换成中文版。
+   - **不删行，改成中文**：请一个**非反重力**的模型（`--rewrite-model`，默认 `gpt-6-luna`，走 CPA 的 Codex 渠道，碰不到谷歌账号，被引用的触发句也不会让它 429）把触发行翻译成简体中文；文件路径、命令、工具名（从出错请求里的工具清单读出来）、网址、代码原样保留，不合格的翻译不用。规则是整行锚定的正则（`^…$`，数字写成 `[0-9]+`），把这一行换成中文版。`--rewrite-model` 可以用逗号写多个（例如 `gpt-6-luna,wb-ai/deepseek-v4.1-flash-sg`），前一个连不上就用下一个；全都连不上时不放弃，暂存起来 15 分钟后再试（最多 3 次）。**不用反重力自己的 Gemini 翻译**：翻译请求里就带着触发句，发给谷歌本身就会 429。
    - **长行先逐句定位**：触发行里有 2～12 句时，先把每一句单独发一次（200 不花预算，每个 429 花一次），只翻译单独就会 429 的那几句，同一行的其他句子不动（规则只换那一句，不锚定整行）。没有哪句单独触发（是几句合起来才触发）时，照旧整行翻译。起因：2026-11-19 Hermes 新开场白 664 字的一行里只有一句触发，整行翻译 3 次都还 429。
    - 每个中文版都要经 CPA 验证不再 429；最多试 3 个。如果直接翻译后仍然 429（说明谷歌是按意思拦的，比如提到 DoS、C2、漏洞利用的安全声明），后面几次改成"意思相近、但不点名具体攻击手段、产品或敏感话题"的中文。都不行就**不加规则**，只通知。设计上**从不删行**：删掉一行说明（尤其是工具用法）可能让 agent 悄悄变笨，比 429 更难发现；确实要删的（例如 2026-11-19 WorkBuddy 的安全声明）由人决定后手动加规则。
    - 已有的规则会先改写这一行时，新规则按改写后的样子生成（新规则排在后面执行）。
@@ -585,7 +585,7 @@ python3 resume_test.py r1 '["Alpha special trigger","Bravo special trigger"]' fi
 python3 recover_test.py                                                                     # 崩溃后撤回没验证的规则
 ```
 
-`run.sh` 的参数：名字、触发词 JSON、`normal|tos`、管理接口行为（`replace` 正常 / `ignore` 不生效 / `append` 追加 / `dropwords` 删词替换 / `timeout` 报错但已写入 / `getfail` 读失败）、系统提示文件，后面可以再接 `cpa_guard.py` 的参数。环境变量 `REWRITER=echo` 让假翻译模型原样返回（模拟翻译失败）。
+`run.sh` 的参数：名字、触发词 JSON、`normal|tos`、管理接口行为（`replace` 正常 / `ignore` 不生效 / `append` 追加 / `dropwords` 删词替换 / `timeout` 报错但已写入 / `getfail` 读失败）、系统提示文件，后面可以再接 `cpa_guard.py` 的参数。环境变量 `REWRITER=echo` 让假翻译模型原样返回（模拟翻译失败），`REWRITER=down` 让 `gpt-6-luna` 返回 502（模拟过载；`wb-ai/` 开头的备用模型照常翻译）。
 
 ### 测试情况（只写做过的）
 

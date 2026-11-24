@@ -87,8 +87,8 @@ class Handler(BaseHTTPRequestHandler):
         d = self.body()
         if "cooldown/reset" in self.path:
             return self.send(200, {})
-        if d.get("model") == TRANSLATOR:
-            if CFG.get("rewriter") == "down":
+        if d.get("model") == TRANSLATOR or str(d.get("model")).startswith("wb-ai/"):
+            if CFG.get("rewriter") == "down" and d["model"] == TRANSLATOR:   # only the first translator is down
                 return self.send(502, {"error": {"code": "server_is_overloaded"}})
             return self.send(200, {"choices": [{"message": {"content": fake_translate(d["messages"][0]["content"])}}]})
         system = next(m["content"] for m in d["messages"] if m["role"] == "system")

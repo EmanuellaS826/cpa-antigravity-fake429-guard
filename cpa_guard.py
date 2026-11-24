@@ -51,6 +51,7 @@ SHORT_DEDUP = 1800             # after "deferred" / "partial"
 GAP_SECONDS = 300              # minimum time between two investigations
 QUIET_SECONDS = 1800           # pause after a real-quota 429
 RETRY_PENDING = 900            # how long to wait before resuming parked work
+REMIND_SECONDS = 1800          # at most one "fake 429s keep coming" push per this many seconds
 RECOVER_EVERY = 60             # retry removing an unverified rule this often
 MAX_ATTEMPTS = 3               # resumes of one parked investigation
 MAX_PENDING = 5
@@ -92,7 +93,7 @@ class State:
         self.path = path
         self.d = {"halted": None, "apply_disabled": None, "hits": [], "handled": {}, "pending": {},
                   "known": {}, "rules": [], "attempts": {}, "cap_notified": {}, "unverified": [],
-                  "last_start": 0, "quiet_until": 0, "resumed_at": 0}
+                  "last_start": 0, "quiet_until": 0, "resumed_at": 0, "reminded_at": 0}
         if os.path.exists(path):
             with open(path, encoding="utf-8") as fh:
                 self.d.update(json.load(fh))
@@ -305,24 +306,36 @@ def classify(path):
     return "fake429", (ft.extract_system(req), ft.model_of(url, req, ""), url, sorted(tool_names(req)))
 
 
+def first_line(system):
+    lines = system.strip().splitlines()
+    return lines[0][:120] if lines else ""
+
+
 def notify(kind, title, detail):
-    """Bark push (env BARK_URL, e.g. https://api.day.app/<key>). Failures are only logged."""
+    """Bark push (env BARK_URL, e.g. https://api.day.app/<key>). Problems that need a human are sent as
+    time-sensitive (shown even in Focus / Do Not Disturb); every push is kept in the Bark history.
+    Success and failure are both logged, so a missed alert can be traced."""
     bark = os.environ.get("BARK_URL", "").rstrip("/")
     if not bark:
         return
     req = urllib.request.Request(bark, method="POST", headers={"Content-Type": "application/json"},
                                  data=json.dumps({"title": "CPA 守护：" + title, "body": detail[:3000] or kind,
-                                                  "group": "cpa-guard"}, ensure_ascii=False).encode("utf-8"))
+                                                  "group": "cpa-guard", "isArchive": "1",
+                                                  "level": "active" if kind in CALM_KINDS else "timeSensitive"},
+                                                 ensure_ascii=False).encode("utf-8"))
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             if json.loads(resp.read().decode("utf-8") or "{}").get("code", 200) != 200:
                 log("Bark 通知失败：服务器没有接受")
+            else:
+                log(f"Bark 通知已送出：{kind}")
     except (OSError, ValueError) as exc:
         log(f"Bark 通知失败：{exc.__class__.__name__}")
 
 
 NOTIFY_KINDS = {"FIXED", "FOUND", "PARTIAL", "MANUAL", "HALT", "GENUINE", "INCONCLUSIVE", "ROLLED_BACK",
-                "ROLLBACK", "PAUSE", "TEST"}
+                "ROLLBACK", "PAUSE", "TEST", "DETECT", "STILL"}
+CALM_KINDS = {"FIXED", "TEST", "DETECT"}     # informational; everything else needs attention
 STATUS_TITLE = {"fixed": "已自动修好", "found": "找到触发句（只报告，没改规则）", "partial": "修好了一部分",
                 "manual": "找到触发句，但没法自动处理", "genuine": "不是提示词问题（账号可能真没额度）",
                 "inconclusive": "这次没查出结果", "rolled_back": "规则没加成，已撤回", "deferred": "推迟"}
@@ -457,19 +470,22 @@ class Guard:
             return
         now = time.time()
         done = self.st.d["handled"].get(fp)
-        if fp in self.st.d["pending"] or (done and now < done.get("until", done["time"] + DEDUP_SECONDS)):
-            return
-        if self.stopped():
-            log(f"已停止状态，跳过 {os.path.basename(path)}")
-            return
-        if self.quarantined():
-            log(f"有没验证的规则还没撤回，先不调查 {os.path.basename(path)}")
-            return
-        if now < self.st.d["quiet_until"]:
-            log("真实额度 429 后的静默期，跳过")
-            return
-        if now - self.st.d["last_start"] < GAP_SECONDS:
-            log("距离上一次调查太近，跳过（真实的 429 之后还会再出现）")
+        skip = None
+        if fp in self.st.d["pending"]:
+            skip = "这个提示已经在排队处理"
+        elif done and now < done.get("until", done["time"] + DEDUP_SECONDS):
+            skip = f"这个提示刚处理过，结果：{STATUS_TITLE.get(done['status'], done['status'])}"
+        elif self.stopped():
+            skip = "guard 处于停止状态（要人工 --resume）"
+        elif self.quarantined():
+            skip = "有没验证的规则还没撤回"
+        elif now < self.st.d["quiet_until"]:
+            skip = "真实额度 429 后的静默期"
+        elif now - self.st.d["last_start"] < GAP_SECONDS:
+            skip = "距离上一次调查太近"
+        if skip:
+            log(f"跳过 {os.path.basename(path)}：{skip}")
+            self.still_failing(fp, model, system, skip)
             return
         akey = agent_key(system)
         if len([t for t in self.st.d["attempts"].get(akey, []) if t > now - DAY]) >= MAX_INVESTIGATIONS_PER_AGENT_DAY:
@@ -479,18 +495,36 @@ class Guard:
                 self.event("PAUSE", f"同一个 agent 24 小时内已经调查 {MAX_INVESTIGATIONS_PER_AGENT_DAY} 次，"
                                     "暂停自动调查它，24 小时后自动恢复（为了少发 429）",
                            f"模型 {model}，系统提示第一行：{system.strip().splitlines()[0][:120]}")
+            else:
+                self.still_failing(fp, model, system, "这个 agent 今天的自动调查次数已用完")
             return
         self.refresh_cost()
         if self.budget.left() < 2 * self.cost:      # checked before an attempt is counted
             self.mark(fp, "deferred", SHORT_DEDUP)
             self.event("DEFER", f"429 预算不够（剩 {self.budget.left()}，至少要 {2 * self.cost}），"
                                 f"{SHORT_DEDUP // 60} 分钟内不再处理这个提示 {fp}")
+            self.still_failing(fp, model, system, "guard 的 429 测试预算用完了")
             return
         log(f"新的上游 429：模型 {model}，系统提示 {len(system)} 字符，指纹 {fp}")
         self.st.d["last_start"] = now
         self.st.d["attempts"].setdefault(akey, []).append(now)
+        self.st.d["reminded_at"] = now     # the DETECT push below covers the next REMIND_SECONDS
         self.st.save()
+        self.event("DETECT", f"发现假 429，开始自动处理（{fp[:8]}）",
+                   f"模型 {model}，系统提示 {len(system)} 字符，第一行：{first_line(system)}\n处理完会再通知结果。")
         self.investigate({"fp": fp, "system": system, "model": model, "narrowed": "", "attempts": 0, "tools": tools})
+
+    def still_failing(self, fp, model, system, why):
+        """Real traffic keeps getting fake 429s while the guard is not working on them: say so,
+        at most once per REMIND_SECONDS, so a storm is never silent."""
+        now = time.time()
+        if now - self.st.d["reminded_at"] < REMIND_SECONDS:
+            return
+        self.st.d["reminded_at"] = now
+        self.st.save()
+        self.event("STILL", f"假 429 还在出现，这次没有自动处理（{fp[:8]}）",
+                   f"原因：{why}。\n模型 {model}，系统提示第一行：{first_line(system)}\n"
+                   f"{REMIND_SECONDS // 60} 分钟内不再重复提醒。")
 
     # ---- investigation
     def investigate(self, item):
@@ -590,9 +624,10 @@ class Guard:
         """The line translated into Simplified Chinese by a NON-Antigravity model (so the Google account is
         not touched and the quoted trigger cannot 429 it), with paths, commands, tool names, URLs and code
         tokens kept exactly; or None. soften=True (used after a plain translation still 429ed): a Chinese
-        paraphrase with the same intent that names no specific sensitive technique, product or topic."""
-        model = self.a.rewrite_model
-        if not model or self.model_re.search(model):
+        paraphrase with the same intent that names no specific sensitive technique, product or topic.
+        --rewrite-model is a comma-separated fallback list: an unreachable model hands over to the next."""
+        models = [m.strip() for m in self.a.rewrite_model.split(",") if m.strip() and not self.model_re.search(m.strip())]
+        if not models:
             return None
         if soften:
             prompt = ("The following line, taken from an AI assistant's system prompt, is rejected by a content filter "
@@ -612,22 +647,27 @@ class Guard:
             prompt += "\n\nThese are tool names and must appear unchanged: " + ", ".join(tools)
         if rejected:
             prompt += "\n\nThese versions were rejected, use different wording:\n" + "\n".join("- " + r for r in rejected)
-        req = urllib.request.Request(
-            self.a.base + "/v1/chat/completions",
-            data=json.dumps({"model": model, "temperature": 1.0, "max_tokens": 300,
-                             "messages": [{"role": "user", "content": prompt}]}).encode("utf-8"),
-            headers={"Authorization": "Bearer " + self.api_key, "Content-Type": "application/json",
-                     "User-Agent": ft.PROBE_UA}, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                cand = json.loads(resp.read().decode("utf-8"))["choices"][0]["message"]["content"].strip()
-        except OSError as exc:
-            code = getattr(exc, "code", None)
-            log(f"翻译模型 {model} 暂时不可用（{exc.__class__.__name__}{f' {code}' if code else ''}）")
-            raise TranslatorDown(f"{model} {code or exc.__class__.__name__}") from None
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
-            log(f"翻译模型没有给出结果（{exc.__class__.__name__}）")
-            return None
+        down = []
+        for model in models:
+            req = urllib.request.Request(
+                self.a.base + "/v1/chat/completions",
+                data=json.dumps({"model": model, "temperature": 1.0, "max_tokens": 300,
+                                 "messages": [{"role": "user", "content": prompt}]}).encode("utf-8"),
+                headers={"Authorization": "Bearer " + self.api_key, "Content-Type": "application/json",
+                         "User-Agent": ft.PROBE_UA}, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    cand = json.loads(resp.read().decode("utf-8"))["choices"][0]["message"]["content"].strip()
+                break
+            except OSError as exc:
+                code = getattr(exc, "code", None)
+                log(f"翻译模型 {model} 暂时不可用（{exc.__class__.__name__}{f' {code}' if code else ''}）")
+                down.append(f"{model} {code or exc.__class__.__name__}")
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                log(f"翻译模型 {model} 没有给出结果（{exc.__class__.__name__}）")
+                return None
+        else:
+            raise TranslatorDown("、".join(down))
         protected = [t for t in line.split() if UNSAFE_LINE.search(t) or re.search(r"[a-z][A-Z]", t)] + list(tools)
         if (not cand or "\n" in cand or cand == line or cand in rejected or len(cand) > 2 * len(line) + 50
                 or not re.search(r"[\u4e00-\u9fff]", cand) or any(t not in cand for t in protected)):
@@ -959,7 +999,7 @@ def main():
     ap.add_argument("--pause", type=float, default=5.0)
     ap.add_argument("--cooldown-wait", type=int, default=70)
     ap.add_argument("--reload-wait", type=float, default=6.0, help="写入规则后等几秒再验证")
-    ap.add_argument("--rewrite-model", default="gpt-6-luna", help="把触发行翻译成中文用的模型（必须不是反重力的模型，走 CPA 的别的渠道），默认 gpt-6-luna；给空字符串就不处理触发行，只报告")
+    ap.add_argument("--rewrite-model", default="gpt-6-luna", help="把触发行翻译成中文用的模型（必须不是反重力的模型，走 CPA 的别的渠道），默认 gpt-6-luna；可以用逗号隔开写多个，前一个连不上就用下一个；给空字符串就不处理触发行，只报告")
     ap.add_argument("--poll", type=float, default=5.0)
     ap.add_argument("--notify-cmd", default="", help="通知命令（shell），环境变量 GUARD_KIND / GUARD_TITLE / GUARD_DETAIL")
     ap.add_argument("--no-apply", action="store_true", help="只报告，不改 CPA 的规则")
