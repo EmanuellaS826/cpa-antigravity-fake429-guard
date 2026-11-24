@@ -77,6 +77,10 @@ class DeadRule(Exception):
     pass
 
 
+class TranslatorDown(ft.Abort):
+    """The translation model could not be reached (HTTP error, overload, timeout): retry later."""
+
+
 def log(msg):
     print(time.strftime("%Y-%m-%d %H:%M:%S ") + msg, flush=True)
 
@@ -617,7 +621,11 @@ class Guard:
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 cand = json.loads(resp.read().decode("utf-8"))["choices"][0]["message"]["content"].strip()
-        except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
+        except OSError as exc:
+            code = getattr(exc, "code", None)
+            log(f"翻译模型 {model} 暂时不可用（{exc.__class__.__name__}{f' {code}' if code else ''}）")
+            raise TranslatorDown(f"{model} {code or exc.__class__.__name__}") from None
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
             log(f"翻译模型没有给出结果（{exc.__class__.__name__}）")
             return None
         protected = [t for t in line.split() if UNSAFE_LINE.search(t) or re.search(r"[a-z][A-Z]", t)] + list(tools)
@@ -738,6 +746,10 @@ class Guard:
         report += [f"已加规则（{how}）：{spec['line'][:80]}" for spec, how in done]
         report += [f"这条没能处理：{s['line'][:200]}（翻译成中文后仍然 429，或翻译不合格；按要求不删行，没加规则）"
                    for s in dead]
+        if isinstance(stop, TranslatorDown) and not done:    # nothing written: retry the same lines later
+            self.park(item, f"翻译模型暂时不可用（{stop}），规则还没写",
+                      found=[f for f in found if f[1] not in finished] or found, more=more)
+            return
         if isinstance(stop, ft.TosViolation):
             self.halt(str(stop))
         if stop is not None:

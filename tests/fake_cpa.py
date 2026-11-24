@@ -3,7 +3,7 @@
 
 usage: fake_cpa.py CONFIG_JSON PORT
 CONFIG_JSON: {"triggers": [substrings that cause a 429], "mode": "normal|tos",
-              "patch": "replace|ignore|append|dropwords|timeout|getfail", "rewriter": "ok|echo"}
+              "patch": "replace|ignore|append|dropwords|timeout|getfail", "rewriter": "ok|echo|down"}
 GET /dump returns the internal state (rules, calls) for the test scripts.
 """
 import json
@@ -88,6 +88,8 @@ class Handler(BaseHTTPRequestHandler):
         if "cooldown/reset" in self.path:
             return self.send(200, {})
         if d.get("model") == TRANSLATOR:
+            if CFG.get("rewriter") == "down":
+                return self.send(502, {"error": {"code": "server_is_overloaded"}})
             return self.send(200, {"choices": [{"message": {"content": fake_translate(d["messages"][0]["content"])}}]})
         system = next(m["content"] for m in d["messages"] if m["role"] == "system")
         STATE["calls"].append("PROBE")
