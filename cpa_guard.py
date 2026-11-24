@@ -16,7 +16,7 @@ them can get the account banned. So the guard spends a budget (see --hourly-budg
 Rules are only ever appended to oauth.providers.antigravity.sensitive-patterns-replace
 (GET the whole provider object, PATCH the list, GET again and require that only the list
 changed). A plain trigger line gets a whole-line delete regex. A line with a path, command,
-tool name or placeholder is first reworded by a NON-Antigravity model (--rewrite-model),
+tool name or placeholder is first reworded by the --rewrite-model list (sent as a user message),
 keeping those tokens; whole-line delete is the last resort. Every rule is checked by sending
 the trigger text through CPA (must be 200); a rule that fails is removed again. A rule that
 was written but not yet checked is recorded in the state and removed after a crash.
@@ -621,12 +621,14 @@ class Guard:
 
     # ---- rules
     def reword(self, line, rejected, tools=(), soften=False):
-        """The line translated into Simplified Chinese by a NON-Antigravity model (so the Google account is
-        not touched and the quoted trigger cannot 429 it), with paths, commands, tool names, URLs and code
-        tokens kept exactly; or None. soften=True (used after a plain translation still 429ed): a Chinese
-        paraphrase with the same intent that names no specific sensitive technique, product or topic.
-        --rewrite-model is a comma-separated fallback list: an unreachable model hands over to the next."""
-        models = [m.strip() for m in self.a.rewrite_model.split(",") if m.strip() and not self.model_re.search(m.strip())]
+        """The line translated into Simplified Chinese, with paths, commands, tool names, URLs and code tokens
+        kept exactly; or None. soften=True (used after a plain translation still 429ed): a Chinese paraphrase
+        with the same intent that names no specific sensitive technique, product or topic.
+        --rewrite-model is a comma-separated fallback list: an unreachable model hands over to the next.
+        The line travels in the USER message, which Google does not filter and CPA's rules do not rewrite,
+        so an Antigravity (Gemini) model may translate too; if it still answers 429, that counts against
+        the 429 budget and the next model is tried."""
+        models = [m.strip() for m in self.a.rewrite_model.split(",") if m.strip()]
         if not models:
             return None
         if soften:
@@ -649,6 +651,10 @@ class Guard:
             prompt += "\n\nThese versions were rejected, use different wording:\n" + "\n".join("- " + r for r in rejected)
         down = []
         for model in models:
+            google = bool(self.model_re.search(model))
+            if google and self.budget.left() < self.cost:
+                down.append(f"{model} 429 预算不够")
+                continue
             req = urllib.request.Request(
                 self.a.base + "/v1/chat/completions",
                 data=json.dumps({"model": model, "temperature": 1.0, "max_tokens": 300,
@@ -661,6 +667,8 @@ class Guard:
                 break
             except OSError as exc:
                 code = getattr(exc, "code", None)
+                if google and code == 429:
+                    self.budget.charge()
                 log(f"翻译模型 {model} 暂时不可用（{exc.__class__.__name__}{f' {code}' if code else ''}）")
                 down.append(f"{model} {code or exc.__class__.__name__}")
             except (ValueError, KeyError, IndexError, TypeError) as exc:
@@ -999,7 +1007,7 @@ def main():
     ap.add_argument("--pause", type=float, default=5.0)
     ap.add_argument("--cooldown-wait", type=int, default=70)
     ap.add_argument("--reload-wait", type=float, default=6.0, help="写入规则后等几秒再验证")
-    ap.add_argument("--rewrite-model", default="gpt-6-luna", help="把触发行翻译成中文用的模型（必须不是反重力的模型，走 CPA 的别的渠道），默认 gpt-6-luna；可以用逗号隔开写多个，前一个连不上就用下一个；给空字符串就不处理触发行，只报告")
+    ap.add_argument("--rewrite-model", default="gpt-6-luna", help="把触发行翻译成中文用的模型（走 CPA，触发行放在用户消息里），默认 gpt-6-luna；可以用逗号隔开写多个，前一个连不上就用下一个；给空字符串就不处理触发行，只报告")
     ap.add_argument("--poll", type=float, default=5.0)
     ap.add_argument("--notify-cmd", default="", help="通知命令（shell），环境变量 GUARD_KIND / GUARD_TITLE / GUARD_DETAIL")
     ap.add_argument("--no-apply", action="store_true", help="只报告，不改 CPA 的规则")
