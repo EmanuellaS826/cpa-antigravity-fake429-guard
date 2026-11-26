@@ -65,6 +65,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, d)
         if self.path == "/v8/management/credentials":
             return self.send(200, {"files": [{"provider": "antigravity", "auth_index": "a1"}]})
+        if self.path == "/v8/management/config":
+            return self.send(200, {})
+        if self.path == "/v1/models":
+            return self.send(200, {"data": [{"id": TRANSLATOR}, {"id": "gemini-3.8-flash-high"}]})
         self.send(404, {})
 
     def do_PATCH(self):

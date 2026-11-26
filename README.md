@@ -11,6 +11,8 @@
 | `README.md` | 本手册 |
 | `find_trigger.py` | 手动找触发句的脚本（第 6 节），只需要 Python 3，不用装任何东西 |
 | `cpa_guard.py` | 常驻服务器、自动处理假 429 的守护进程（第 11 节），需要和 `find_trigger.py` 放在同一个文件夹 |
+| `install.sh`、`guard.env.example` | `cpa_guard` 的一键安装 / 升级脚本和配置模板 |
+| `DEPLOY.md` | 给 AI 照做的 `cpa_guard` 部署步骤（用安装脚本，邮件通知） |
 | `REVIEW.md` | `cpa_guard.py` 的设计取舍、三轮代码审查的结论和测试记录 |
 | `tests/` | 假 CPA 和回归测试脚本，不碰真实账号（第 11 节"自己跑测试"） |
 
@@ -518,7 +520,7 @@ python3 /root/find_trigger.py --log <日志路径> [--baseline <上一版>]
 
 ## 11. 自动处理：cpa_guard（在 CPA 服务器上常驻运行）
 
-不想手动找触发句时用它。它盯着 CPA 的 `error-*.log`，发现新的反重力假 429 就自己找触发行、写规则、验证，**全程不需要人决定**。人只会收到通知：`state/events.log`，配了 `BARK_URL` 就推送到手机（Bark），也可以用 `--notify-cmd` 接别的通知。开始处理时推一条"发现假 429"，处理完推结果；假 429 还在出现、guard 却没去处理（同一提示刚处理过、排队中、预算用完、停止状态等）时，最多每 30 分钟推一条"假 429 还在出现"，所以一波 429 不会没有动静。需要人看的通知用 Bark 的"时效性通知"（专注模式下也会显示），所有通知都存进 Bark 历史；每次推送成功或失败都会写进 guard 日志。
+不想手动找触发句时用它。它盯着 CPA 的 `error-*.log`，发现新的反重力假 429 就自己找触发行、写规则、验证，**全程不需要人决定**。人只会收到通知：`state/events.log`，配了邮件（`SMTP_HOST` 等）就发邮件，配了 `BARK_URL` 就推送到手机（Bark），两种可以同时用，也可以用 `--notify-cmd` 接别的通知。开始处理时推一条"发现假 429"，处理完推结果；假 429 还在出现、guard 却没去处理（同一提示刚处理过、排队中、预算用完、停止状态等）时，最多每 30 分钟推一条"假 429 还在出现"，所以一波 429 不会没有动静。需要人看的通知用 Bark 的"时效性通知"（专注模式下也会显示），所有通知都存进 Bark 历史；每次推送或发信成功、失败都会写进 guard 日志。
 
 ### 它怎么做（对着 `cpa_guard.py`）
 
@@ -539,34 +541,18 @@ python3 /root/find_trigger.py --log <日志路径> [--baseline <上一版>]
    - 同一个 agent 24 小时内已调查 3 次：暂停调查它 24 小时（发一次 PAUSE 事件）；24 小时内已加 3 条规则：不再自动加。
    - 暂存的调查最多接着查 3 次；查不完时，已经确认的触发句照样加规则。
 
-### 部署（以 root、brokechubb 安装脚本的默认路径为例）
+### 部署
 
-1. 把 `cpa_guard.py`、`find_trigger.py` 放到 `/root/cpa-guard/`。
-2. 建一个只有 root 能读的环境文件 `/root/cpa-guard/guard.env`（`chmod 600`）：
-   ```bash
-   CPA_MGMT_KEY=你的管理密钥
-   BARK_URL=https://api.day.app/你的Bark密钥     # 不用 Bark 就不写这行
-   # CPA_API_KEY 可以不写，脚本会从 config.yaml 的 api-keys 读第一个
-   ```
-3. 先发一条测试通知：`set -a; . /root/cpa-guard/guard.env; set +a; python3 /root/cpa-guard/cpa_guard.py --test-notify`。
-4. 建 `~/.config/systemd/user/cpa-guard.service`：
-   ```ini
-   [Unit]
-   Description=cpa_guard
-   After=cliproxyapi.service
+用安装脚本，步骤见 [`DEPLOY.md`](DEPLOY.md)（写给 AI 照做）。简单说：下载仓库，root 执行 `bash install.sh`；第一次会生成 `/root/cpa-guard/guard.env`（权限 600，模板是 `guard.env.example`），填好管理密钥和邮件（或 Bark）再执行一次。脚本会：
 
-   [Service]
-   EnvironmentFile=/root/cpa-guard/guard.env
-   ExecStart=/usr/bin/python3 -u /root/cpa-guard/cpa_guard.py --no-apply
-   Restart=always
-   RestartSec=30
+1. 自动找 CPA 的 `config.yaml`、地址（`port`）、日志目录（正在运行的 CPA 打开的日志文件所在目录，其次是 `auth-dir/logs`），找不到或找到多个就停下，让人在 `guard.env` 里填 `CPA_DIR` / `LOG_DIR` / `CPA_BASE`。
+2. 用管理密钥读一次配置，确认密钥对、`oauth.providers.antigravity` 存在；用客户端密钥列模型，从 `deepseek-flash`、`gemini-3.8-flash-high` 里选 CPA 有的当翻译模型（或用 `REWRITE_MODEL`）。没有基础规则（第 3 节）或没设 `error-logs-max-files` 只提醒，不改 CPA 配置。
+3. 把 `cpa_guard.py`、`find_trigger.py` 复制到 `/root/cpa-guard/`，发一条测试通知（`--test-notify`，任一已配置的通知渠道失败就停下）。
+4. 写系统级服务 `/etc/systemd/system/cpa-guard.service`（`Restart=always`，开机自启），启动并确认在运行。再执行一次就是升级（`guard.env` 保留）。
 
-   [Install]
-   WantedBy=default.target
-   ```
-   然后 `systemctl --user daemon-reload && systemctl --user enable --now cpa-guard`（root 的用户级服务可能要先 `export XDG_RUNTIME_DIR=/run/user/0`）。
-5. 建议先用 `--no-apply`（只找、只报告，不改规则）跑一两次，看推送里找到的句子和打算的处理对不对，再去掉 `--no-apply` 重启服务。
-6. 路径不一样就加参数：`--cpa-dir`（`config.yaml` 所在目录）、`--log-dir`、`--state-dir`、`--base`（CPA 地址）。翻译模型 `--rewrite-model` 写你 CPA 里有的模型，可以用逗号写多个备用。
+`bash install.sh --check` 只做 1～3 步的检查和测试通知，不装服务。`guard.env` 里 `REPORT_ONLY='1'` 对应 `--no-apply`（只找、只报告，不改规则）；`HOURLY_BUDGET` / `DAILY_BUDGET` 默认 10 / 24。用旧办法（root 的用户级服务 `~/.config/systemd/user/cpa-guard.service`）装过的机器，脚本会拒绝安装，免得两个同时运行。
+
+邮件：`SMTP_HOST`、`SMTP_PORT`（465 用 SSL，587 用 STARTTLS，默认 465；一定加密，不会明文发密码）、`SMTP_USER`、`SMTP_PASS`（邮箱的授权码）、`MAIL_TO`（逗号隔开，默认发给 `SMTP_USER`），可选 `MAIL_FROM`。
 
 运行后的文件：`state/state.json`（预算、暂存的调查等）、`state/events.log`（所有结果）、`state/backups/`（每次改规则前的 `config.yaml` 和 `antigravity` 配置 JSON，各保留最近 10 个，权限 600）。
 
@@ -592,4 +578,5 @@ python3 recover_test.py                                                         
 - 假 CPA：上面这些场景，以及路径行/工具行翻译成功、翻译失败不加规则、两处触发中途暂存、`--dry-run` 守护进程收到 403 日志。
 - 真实 CPA（8.0.76）：管理接口读规则、原样写回、`/v8/management/credentials`、清冷却接口都测过。
 - 真实使用（2026-11-17，Hermes + gemini-3.8-flash-high）：自动找到两处触发句（第 10 节最后一行），换成中文后触发文字和完整提示都返回 200。找全用了约 19 个 429（约 38 次上游命中），所以默认预算会让它分几个小时完成。
+- 邮件和安装脚本（2026-11-26，Debian 13、Python 3.13、CPA 8.1.2）：用本地假 SMTP 服务器（自签证书）测过 465 SSL、587 STARTTLS、多个收件人、证书不受信任时拒发、Bark 失败时 `--test-notify` 返回失败；`install.sh --check` 对真实 CPA 自动找到配置、地址、翻译模型和日志目录，管理密钥错、通知没填、翻译模型不存在都会停下并说明原因；用假 CPA 完整安装成系统服务，放进一个假 429 日志后服务自动修好并发出"发现假 429""已自动修好"两封邮件；再执行一次（升级）正常重启。没有用真实邮箱发过信。
 - 三轮代码审查的结论和修改见 `REVIEW.md`。

@@ -28,9 +28,12 @@ Usage:
   python3 cpa_guard.py --status             # budget, halted flag, pending work
   python3 cpa_guard.py --resume             # clear the halted / apply-disabled flags
 Keys: CPA_API_KEY (client key; read from config.yaml when unset), CPA_MGMT_KEY.
+Notifications: BARK_URL and/or SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, MAIL_TO, MAIL_FROM (see notify_mail).
 """
 
 import argparse
+import email.message
+import email.utils
 import urllib.error
 import urllib.request
 import fcntl
@@ -38,6 +41,9 @@ import hashlib
 import json
 import os
 import re
+import smtplib
+import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -312,25 +318,74 @@ def first_line(system):
 
 
 def notify(kind, title, detail):
+    """Send to every configured channel: Bark (BARK_URL) and e-mail (SMTP_HOST ...).
+    Success and failure are both logged, so a missed alert can be traced.
+    Returns True when at least one channel accepted the message."""
+    title = "CPA 守护：" + title
+    ok = False
+    if os.environ.get("BARK_URL", "").strip():
+        ok = notify_bark(kind, title, detail[:3000] or kind) or ok
+    if os.environ.get("SMTP_HOST", "").strip():
+        ok = notify_mail(kind, title, detail or kind) or ok
+    return ok
+
+
+def notify_bark(kind, title, body):
     """Bark push (env BARK_URL, e.g. https://api.day.app/<key>). Problems that need a human are sent as
-    time-sensitive (shown even in Focus / Do Not Disturb); every push is kept in the Bark history.
-    Success and failure are both logged, so a missed alert can be traced."""
-    bark = os.environ.get("BARK_URL", "").rstrip("/")
-    if not bark:
-        return
-    req = urllib.request.Request(bark, method="POST", headers={"Content-Type": "application/json"},
-                                 data=json.dumps({"title": "CPA 守护：" + title, "body": detail[:3000] or kind,
-                                                  "group": "cpa-guard", "isArchive": "1",
+    time-sensitive (shown even in Focus / Do Not Disturb); every push is kept in the Bark history."""
+    req = urllib.request.Request(os.environ["BARK_URL"].strip().rstrip("/"), method="POST",
+                                 headers={"Content-Type": "application/json"},
+                                 data=json.dumps({"title": title, "body": body, "group": "cpa-guard", "isArchive": "1",
                                                   "level": "active" if kind in CALM_KINDS else "timeSensitive"},
                                                  ensure_ascii=False).encode("utf-8"))
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             if json.loads(resp.read().decode("utf-8") or "{}").get("code", 200) != 200:
                 log("Bark 通知失败：服务器没有接受")
-            else:
-                log(f"Bark 通知已送出：{kind}")
+                return False
     except (OSError, ValueError) as exc:
         log(f"Bark 通知失败：{exc.__class__.__name__}")
+        return False
+    log(f"Bark 通知已送出：{kind}")
+    return True
+
+
+def notify_mail(kind, subject, body):
+    """E-mail through SMTP. Env: SMTP_HOST, SMTP_PORT (465 = SSL, anything else = STARTTLS; default 465),
+    SMTP_USER, SMTP_PASS, MAIL_TO (comma-separated; default SMTP_USER), MAIL_FROM (default SMTP_USER).
+    TLS is always required, so the password never travels in clear text."""
+    host = os.environ["SMTP_HOST"].strip()
+    user = os.environ.get("SMTP_USER", "").strip()
+    sender = os.environ.get("MAIL_FROM", "").strip() or user
+    to = [x.strip() for x in (os.environ.get("MAIL_TO", "").strip() or user).split(",") if x.strip()]
+    if not sender or not to:
+        log("邮件通知失败：SMTP_USER（或 MAIL_FROM / MAIL_TO）没填")
+        return False
+    msg = email.message.EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = ", ".join(to)
+    msg["Date"] = email.utils.formatdate(localtime=True)
+    msg["Message-ID"] = email.utils.make_msgid(domain=sender.rpartition("@")[2] or None)
+    msg.set_content(f"{body}\n\n--\ncpa_guard @ {socket.gethostname()}\n")
+    try:
+        port = int(os.environ.get("SMTP_PORT", "").strip() or 465)
+        ctx = ssl.create_default_context()
+        if port == 465:
+            server = smtplib.SMTP_SSL(host, port, timeout=30, context=ctx)
+        else:
+            server = smtplib.SMTP(host, port, timeout=30)
+        with server:
+            if port != 465:
+                server.starttls(context=ctx)
+            if user:
+                server.login(user, os.environ.get("SMTP_PASS", ""))
+            server.send_message(msg)
+    except (OSError, ValueError, smtplib.SMTPException) as exc:
+        log(f"邮件通知失败：{exc.__class__.__name__}: {str(exc)[:200]}")
+        return False
+    log(f"邮件通知已送出：{kind}")
+    return True
 
 
 NOTIFY_KINDS = {"FIXED", "FOUND", "PARTIAL", "MANUAL", "HALT", "GENUINE", "INCONCLUSIVE", "ROLLED_BACK",
@@ -1019,8 +1074,14 @@ def main():
     a = ap.parse_args()
     g = Guard(a)
     if a.test_notify:
-        notify("TEST", "测试通知", "如果你看到这条，说明 cpa_guard 的通知能送到。")
-        return 0
+        channels = [n for n in ("BARK_URL", "SMTP_HOST") if os.environ.get(n, "").strip()]
+        if not channels:
+            print("没有配置任何通知：在 guard.env 里填 SMTP_HOST 等（邮件）或 BARK_URL（Bark）。")
+            return 1
+        title, detail = "CPA 守护：测试通知", "如果你看到这条，说明 cpa_guard 的通知能送到。"
+        sent = [notify_bark("TEST", title, detail) if n == "BARK_URL" else notify_mail("TEST", title, detail)
+                for n in channels]
+        return 0 if all(sent) else 1
     if a.status:
         print(json.dumps({"halted": g.st.d["halted"], "apply_disabled": g.st.d["apply_disabled"],
                           "unverified_rules": g.st.d["unverified"], "budget_left": g.budget.left(),
